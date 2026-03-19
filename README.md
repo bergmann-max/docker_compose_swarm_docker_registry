@@ -45,20 +45,29 @@ No file needs to be stored in the repository.
 
 ### Create the Docker Secret
 
-Use the following command to create the secret directly without storing credentials in a file.
-You will be prompted for the password (input is not echoed):
+Use the following commands to create the secret directly without storing credentials in a file.
+`htpasswd` from the `apache2-utils` package is required. Install it if needed:
 
 ```sh
-read -s p && echo "admin:$(openssl passwd -apr1 "$p")" | docker secret create registry_htpasswd -
+apt-get install -y apache2-utils
 ```
 
-Replace `admin` with the desired username if needed.
-
-If the secret already exists and the credentials were changed, remove it first and then recreate it:
+Then create the secret (replace `admin` with the desired username):
 
 ```sh
+htpasswd -nbB admin 'yourpassword' | docker secret create registry_htpasswd -
+```
+
+> **Note:** `registry:3` requires bcrypt password hashes (`-B` flag). MD5-based hashes generated
+> by `openssl passwd -apr1` are not supported and will result in 401 Unauthorized errors.
+
+If the secret already exists and the credentials were changed, remove the stack first, then recreate the secret:
+
+```sh
+docker stack rm registry
 docker secret rm registry_htpasswd
-read -s p && echo "admin:$(openssl passwd -apr1 "$p")" | docker secret create registry_htpasswd -
+htpasswd -nbB admin 'yourpassword' | docker secret create registry_htpasswd -
+docker stack deploy -c docker-compose.yml registry
 ```
 
 ## Deployment
