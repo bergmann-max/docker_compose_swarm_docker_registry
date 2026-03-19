@@ -24,7 +24,6 @@ Before deployment, the following dependencies must be available:
 
 ```text
 .
-├── auth/htpasswd
 ├── docker-compose.yml
 └── README.md
 ```
@@ -39,50 +38,38 @@ Before using this setup in production, you should at least adjust the following 
 - `volumes.registry-data.driver_opts.o`: address and options of the NFS server
 - `volumes.registry-data.driver_opts.device`: export path on the NFS server
 
-The file [`auth/htpasswd`] contains the credentials for Basic Auth and is mounted as a Docker Secret.
-
 ## Authentication
 
-The `auth/htpasswd` file must use the format `user:hash`.
-You can generate an entry with `htpasswd`:
+The credentials are stored as a Docker Secret in `user:hash` format.
+No file needs to be stored in the repository.
+
+### Create the Docker Secret
+
+Use the following command to create the secret directly without storing credentials in a file.
+You will be prompted for the password (input is not echoed):
 
 ```sh
-htpasswd -nb admin password
+read -s p && echo "admin:$(openssl passwd -apr1 "$p")" | docker secret create registry_htpasswd -
 ```
 
-Replace `admin` and `password` with the actual credentials.
-If multiple users are required, extend the file accordingly.
-
-The output will look roughly like this:
-
-```text
-admin:$2y$...
-```
-
-## Deployment
-
-### 1. Create the Docker Secret
-
-If the secret does not exist yet:
-
-```sh
-docker secret create registry_htpasswd ./auth/htpasswd
-```
+Replace `admin` with the desired username if needed.
 
 If the secret already exists and the credentials were changed, remove it first and then recreate it:
 
 ```sh
 docker secret rm registry_htpasswd
-docker secret create registry_htpasswd ./auth/htpasswd
+read -s p && echo "admin:$(openssl passwd -apr1 "$p")" | docker secret create registry_htpasswd -
 ```
 
-### 2. Deploy the Stack
+## Deployment
+
+### 1. Deploy the Stack
 
 ```sh
 docker stack deploy -c docker-compose.yml registry
 ```
 
-### 3. Check the Rollout
+### 2. Check the Rollout
 
 ```sh
 docker service ps registry_registry --no-trunc
