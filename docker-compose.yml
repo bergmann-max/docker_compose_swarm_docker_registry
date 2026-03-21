@@ -3,8 +3,42 @@ version: "3.8"
 secrets:
   registry_htpasswd:
     external: true
+  registry_proxy_htpasswd:
+    external: true
 
 services:
+  registry-proxy:
+    image: "registry:3"
+    environment:
+      REGISTRY_LOG_LEVEL: "info"
+      REGISTRY_HTTP_ADDR: "0.0.0.0:5000"
+      REGISTRY_HTTP_HOST: "https://registry-proxy.example.com"
+      REGISTRY_PROXY_REMOTEURL: "https://registry-1.docker.io"
+      REGISTRY_PROXY_USERNAME: "${DOCKERHUB_USERNAME}"
+      REGISTRY_PROXY_PASSWORD: "${DOCKERHUB_TOKEN}"
+      REGISTRY_AUTH: "htpasswd"
+      REGISTRY_AUTH_HTPASSWD_REALM: "Registry Proxy Realm"
+      REGISTRY_AUTH_HTPASSWD_PATH: "/run/secrets/registry_proxy_htpasswd"
+    volumes:
+      - "registry-proxy-data:/var/lib/registry"
+    secrets:
+      - source: registry_proxy_htpasswd
+        target: registry_proxy_htpasswd
+    networks:
+      - traefik
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+      labels:
+        traefik.enable: "true"
+        traefik.docker.network: "traefik"
+        traefik.http.routers.registry-proxy.rule: "Host(`registry-proxy.example.com`)"
+        traefik.http.routers.registry-proxy.entrypoints: "websecure"
+        traefik.http.routers.registry-proxy.tls: "true"
+        traefik.http.routers.registry-proxy.tls.certresolver: "letsencrypt"
+        traefik.http.services.registry-proxy.loadbalancer.server.port: "5000"
+
   registry:
     image: "registry:3"
     environment:
@@ -40,6 +74,13 @@ networks:
     name: "traefik"
 
 volumes:
+  registry-proxy-data:
+    driver: local
+    driver_opts:
+      type: "nfs"
+      o: "addr=storage.example.com,nfsvers=4,hard,intr"
+      device: ":/var/lib/docker-volumes/registry-proxy-data"
+
   registry-data:
     driver: local
     driver_opts:

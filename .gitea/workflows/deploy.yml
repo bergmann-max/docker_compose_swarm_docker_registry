@@ -1,0 +1,252 @@
+# Gitea secrets:
+#  - SWARM_SSH_KEY
+#  - SWARM_MANAGER_HOST
+#  - SWARM_MANAGER_USER
+#  - REGISTRY_BASIC_AUTH_USER
+#  - REGISTRY_BASIC_AUTH_PASSWORD
+#  - REGISTRY_PROXY_BASIC_AUTH_USER
+#  - REGISTRY_PROXY_BASIC_AUTH_PASSWORD
+#  - DOCKERHUB_USERNAME          (optional, prevents Docker Hub rate limits)
+#  - DOCKERHUB_TOKEN             (optional, Docker Hub access token)
+
+name: Deploy / Reconcile Registry Stack
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+
+jobs:
+  registry:
+    runs-on: ubuntu
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Ensure required tools are available
+        run: |
+          set -eu
+
+          command -v ssh >/dev/null || (
+            apt-get update
+            apt-get install -y openssh-client apache2-utils
+          )
+
+          command -v htpasswd >/dev/null || (
+            apt-get update
+            apt-get install -y apache2-utils
+          )
+
+      - name: Prepare SSH key and known_hosts
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SWARM_SSH_KEY }}
+          SWARM_MANAGER_HOST: ${{ secrets.SWARM_MANAGER_HOST }}
+        run: |
+          set -eu
+
+          eval "$(ssh-agent -s)"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+
+          mkdir -p ~/.ssh
+          chmod u=rwx,go= ~/.ssh
+
+          ssh-keyscan -H "$SWARM_MANAGER_HOST" >> ~/.ssh/known_hosts
+          chmod u=rw,go= ~/.ssh/known_hosts
+
+      - name: Create remote Docker context
+        env:
+          SWARM_MANAGER_HOST: ${{ secrets.SWARM_MANAGER_HOST }}
+          SWARM_MANAGER_USER: ${{ secrets.SWARM_MANAGER_USER }}
+        run: |
+          set -eu
+
+          docker context rm swarm-remote >/dev/null 2>&1 || true
+          docker context create swarm-remote \
+            --docker "host=ssh://${SWARM_MANAGER_USER}@${SWARM_MANAGER_HOST}"
+
+      - name: Check swarm connectivity
+        env:
+          DOCKER_CONTEXT: swarm-remote
+        run: |
+          set -eu
+          docker info >/dev/null
+          docker node ls >/dev/null
+
+      - name: Generate htpasswd content
+        id: htpasswd
+        env:
+          REGISTRY_BASIC_AUTH_USER: ${{ secrets.REGISTRY_BASIC_AUTH_USER }}
+          REGISTRY_BASIC_AUTH_PASSWORD: ${{ secrets.REGISTRY_BASIC_AUTH_PASSWORD }}
+          REGISTRY_PROXY_BASIC_AUTH_USER: ${{ secrets.REGISTRY_PROXY_BASIC_AUTH_USER }}
+          REGISTRY_PROXY_BASIC_AUTH_PASSWORD: ${{ secrets.REGISTRY_PROXY_BASIC_AUTH_PASSWORD }}
+        run: |
+          set -eu
+
+          htpasswd_line="$(htpasswd -nbB "$REGISTRY_BASIC_AUTH_USER" "$REGISTRY_BASIC_AUTH_PASSWORD")"
+          printf '%s\n' "$htpasswd_line" > registry_htpasswd.txt
+          chmod u=rw,go= registry_htpasswd.txt
+
+          proxy_htpasswd_line="$(htpasswd -nbB "$REGISTRY_PROXY_BASIC_AUTH_USER" "$REGISTRY_PROXY_BASIC_AUTH_PASSWORD")"
+          printf '%s\n' "$proxy_htpasswd_line" > registry_proxy_htpasswd.txt
+          chmod u=rw,go= registry_proxy_htpasswd.txt
+
+      - name: Check external secret exists
+        id: check_secret
+        env:
+          DOCKER_CONTEXT: swarm-remote
+        run: |
+          set +e
+          docker secret inspect registry_htpasswd >/dev/null 2>&1
+          if [ "$?" -eq 0 ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check proxy external secret exists
+        id: check_proxy_secret
+        env:
+          DOCKER_CONTEXT: swarm-remote
+        run: |
+          set +e
+          docker secret inspect registry_proxy_htpasswd >/dev/null 2>&1
+          if [ "$?" -eq 0 ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create external secret when missing
+        if: steps.check_secret.outputs.exists != 'true'
+        env:
+          DOCKER_CONTEXT: swarm-remote
+        run: |
+          set -eu
+          docker secret create registry_htpasswd registry_htpasswd.txt >/dev/null
+
+      - name: Create proxy external secret when missing
+        if: steps.check_proxy_secret.outputs.exists != 'true'
+        env:
+          DOCKER_CONTEXT: swarm-remote
+        run: |
+          set -eu
+          docker secret create registry_proxy_htpasswd registry_proxy_htpasswd.txt >/dev/null
+
+      - name: Check external network exists
+        id: check_network
+        env:
+          DOCKER_CONTEXT: swarm-remote
+        run: |
+          set +e
+          docker network inspect traefik >/dev/null 2>&1
+          if [ "$?" -eq 0 ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check stack file renders
+        id: check_stack
+        env:
+          DOCKER_CONTEXT: swarm-remote
+        run: |
+          set +e
+          docker stack config --compose-file docker-compose.yml >/dev/null 2>&1
+          if [ "$?" -eq 0 ]; then
+            echo "valid=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check service replica count
+        id: check_service
+        env:
+          DOCKER_CONTEXT: swarm-remote
+        run: |
+          set +e
+
+          service_name="registry_registry"
+          expected_replicas="1"
+
+          docker service inspect "$service_name" >/dev/null 2>&1
+          if [ "$?" -ne 0 ]; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "replicas_match=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          actual_replicas="$(docker service inspect "$service_name" --format '{{.Spec.Mode.Replicated.Replicas}}' 2>/dev/null)"
+          running_replicas="$(docker service ls --filter name="$service_name" --format '{{.Replicas}}' 2>/dev/null)"
+
+          echo "exists=true" >> "$GITHUB_OUTPUT"
+
+          if [ "$actual_replicas" = "$expected_replicas" ] && printf '%s' "$running_replicas" | grep -Eq '^1/1$'; then
+            echo "replicas_match=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "replicas_match=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Decide whether reconcile deploy is needed
+        id: decide
+        run: |
+          set -eu
+
+          deploy=false
+
+          [ "${{ steps.check_secret.outputs.exists }}" = "true" ] || deploy=true
+          [ "${{ steps.check_proxy_secret.outputs.exists }}" = "true" ] || deploy=true
+          [ "${{ steps.check_network.outputs.exists }}" = "true" ] || deploy=true
+          [ "${{ steps.check_stack.outputs.valid }}" = "true" ] || deploy=true
+          [ "${{ steps.check_service.outputs.exists }}" = "true" ] || deploy=true
+          [ "${{ steps.check_service.outputs.replicas_match }}" = "true" ] || deploy=true
+
+          echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
+
+      - name: Fail scheduled run when prerequisites are missing
+        if: gitea.event_name == 'schedule' && (steps.check_network.outputs.exists != 'true' || steps.check_stack.outputs.valid != 'true')
+        run: |
+          echo "Scheduled reconcile cannot continue."
+          echo "network traefik exists: ${{ steps.check_network.outputs.exists }}"
+          echo "stack file valid: ${{ steps.check_stack.outputs.valid }}"
+          exit 1
+
+      - name: Deploy on push or manual run
+        if: gitea.event_name == 'push' || gitea.event_name == 'workflow_dispatch'
+        env:
+          DOCKER_CONTEXT: swarm-remote
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -eu
+          docker stack deploy \
+            --compose-file docker-compose.yml \
+            registry
+
+      - name: Deploy on scheduled drift
+        if: gitea.event_name == 'schedule' && steps.decide.outputs.deploy == 'true' && steps.check_network.outputs.exists == 'true' && steps.check_stack.outputs.valid == 'true'
+        env:
+          DOCKER_CONTEXT: swarm-remote
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -eu
+          docker stack deploy \
+            --compose-file docker-compose.yml \
+            registry
+
+      - name: Show result
+        env:
+          DOCKER_CONTEXT: swarm-remote
+        run: |
+          set +e
+          docker stack services registry
+          docker stack ps registry
+
+      - name: Remove temporary local htpasswd file
+        if: always()
+        run: |
+          rm -f registry_htpasswd.txt registry_proxy_htpasswd.txt
