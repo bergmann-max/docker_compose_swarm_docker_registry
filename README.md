@@ -9,16 +9,17 @@ The deployment is designed for Docker Swarm and uses:
 
 - Basic Auth via Docker Secret
 - Traefik as a reverse proxy
-- an external NFS volume for persistent images
+- An external NFS volume for persistent images
+- A pull-through cache for Docker Hub (`registry-proxy`)
 
 ## Prerequisites
 
 Before deployment, the following dependencies must be available:
 
 - Docker Engine with Swarm enabled
-- an external Docker network named `traefik`
+- An external Docker network named `traefik`
 - Traefik with TLS termination in the same Swarm
-- a reachable NFS server for the registry volume
+- A reachable NFS server for the registry volumes
 
 ## Project Structure
 
@@ -28,40 +29,60 @@ Before deployment, the following dependencies must be available:
 └── README.md
 ```
 
+## Services
+
+### `registry`
+
+A private Docker registry for storing and distributing your own images.
+
+### `registry-proxy`
+
+A pull-through cache that proxies requests to Docker Hub (`registry-1.docker.io`).
+Images are fetched from Docker Hub on first pull and cached locally on NFS.
+Subsequent pulls are served directly from the cache.
+
 ## Configuration
 
 The main configuration is located in [`docker-compose.yml`].
-Before using this setup in production, you should at least adjust the following values:
+Before using this setup in production, adjust the following values:
 
-- `REGISTRY_HTTP_HOST`: public URL of the registry
-- `traefik.http.routers.registry.rule`: registry hostname
-- `volumes.registry-data.driver_opts.o`: address and options of the NFS server
-- `volumes.registry-data.driver_opts.device`: export path on the NFS server
+| Variable / Label | Service | Description |
+|---|---|---|
+| `REGISTRY_HTTP_HOST` | both | Public URL of the registry |
+| `traefik.http.routers.*.rule` | both | Hostname for Traefik routing |
+| `volumes.*.driver_opts.o` | both | NFS server address and options |
+| `volumes.*.driver_opts.device` | both | Export path on the NFS server |
+| `REGISTRY_PROXY_USERNAME` | registry-proxy | Docker Hub username (optional) |
+| `REGISTRY_PROXY_PASSWORD` | registry-proxy | Docker Hub access token (optional) |
 
 ## Authentication
 
-The credentials are stored as a Docker Secret in `user:hash` format.
-No file needs to be stored in the repository.
+Credentials are stored as Docker Secrets in `user:hash` format.
+No credentials are stored in the repository.
 
-### Create the Docker Secret
-
-Use the following commands to create the secret directly without storing credentials in a file.
-`htpasswd` from the `apache2-utils` package is required. Install it if needed:
+`htpasswd` from the `apache2-utils` package is required:
 
 ```sh
 apt-get install -y apache2-utils
 ```
 
-Then create the secret (replace `admin` with the desired username):
+> **Note:** `registry:3` requires bcrypt password hashes (`-B` flag). MD5-based hashes are not supported and will cause 401 Unauthorized errors.
 
+### Create Secrets
+
+**Private registry:**
 ```sh
 htpasswd -nbB admin 'yourpassword' | docker secret create registry_htpasswd -
 ```
 
-> **Note:** `registry:3` requires bcrypt password hashes (`-B` flag). MD5-based hashes generated
-> by `openssl passwd -apr1` are not supported and will result in 401 Unauthorized errors.
+**Pull-through proxy:**
+```sh
+htpasswd -nbB proxyuser 'yourpassword' | docker secret create registry_proxy_htpasswd -
+```
 
-If the secret already exists and the credentials were changed, remove the stack first, then recreate the secret:
+### Recreate a Secret
+
+If credentials change, remove the stack first, then recreate the secret:
 
 ```sh
 docker stack rm registry
@@ -72,41 +93,91 @@ docker stack deploy -c docker-compose.yml registry
 
 ## Deployment
 
-### 1. Deploy the Stack
+### 1. Create required secrets (once)
 
 ```sh
+htpasswd -nbB admin 'yourpassword' | docker secret create registry_htpasswd -
+htpasswd -nbB proxyuser 'yourpassword' | docker secret create registry_proxy_htpasswd -
+```
+
+### 2. Deploy the stack
+
+```sh
+DOCKERHUB_USERNAME=myuser \
+DOCKERHUB_TOKEN=mytoken \
 docker stack deploy -c docker-compose.yml registry
 ```
 
-### 2. Check the Rollout
+`DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` are optional but recommended to avoid
+Docker Hub rate limits (100 pulls/6h anonymous, 200/6h free account).
+
+### 3. Check the rollout
 
 ```sh
-docker service ps registry_registry --no-trunc
-```
-
-Optional:
-
-```sh
-docker service logs -f registry_registry
+docker stack services registry
+docker stack ps registry
 ```
 
 ## Usage
 
-Log in to the registry:
+### Private registry
 
 ```sh
 docker login registry.example.com
-```
-
-Push an image:
-
-```sh
 docker tag alpine:latest registry.example.com/alpine:latest
 docker push registry.example.com/alpine:latest
+docker pull registry.example.com/alpine:latest
 ```
+
+### Pull-through cache (Docker Hub mirror)
+
+Login once:
+```sh
+docker login registry-proxy.example.com
+```
+
+Pull images through the cache:
+```sh
+# official images require the "library/" prefix
+docker pull registry-proxy.example.com/library/nginx:latest
+
+# non-official images
+docker pull registry-proxy.example.com/bitnami/postgresql:15
+```
+
+Or configure it as a daemon-level mirror so plain `docker pull nginx` is transparently cached.
+Edit `/etc/docker/daemon.json` on each Docker host:
+
+```json
+{
+  "registry-mirrors": ["https://registry-proxy.example.com"]
+}
+```
+
+Then restart Docker:
+```sh
+sudo systemctl restart docker
+```
+
+## CI/CD (Gitea Actions)
+
+The workflow in `.gitea/workflows/deploy.yml` handles automated deployments.
+The following secrets must be configured in Gitea:
+
+| Secret | Required | Description |
+|---|---|---|
+| `SWARM_SSH_KEY` | yes | SSH private key for the Swarm manager |
+| `SWARM_MANAGER_HOST` | yes | Hostname or IP of the Swarm manager |
+| `SWARM_MANAGER_USER` | yes | SSH user on the Swarm manager |
+| `REGISTRY_BASIC_AUTH_USER` | yes | Username for the private registry |
+| `REGISTRY_BASIC_AUTH_PASSWORD` | yes | Password for the private registry |
+| `REGISTRY_PROXY_BASIC_AUTH_USER` | yes | Username for the proxy registry |
+| `REGISTRY_PROXY_BASIC_AUTH_PASSWORD` | yes | Password for the proxy registry |
+| `DOCKERHUB_USERNAME` | no | Docker Hub username (avoids rate limits) |
+| `DOCKERHUB_TOKEN` | no | Docker Hub access token |
 
 ## Notes
 
 - This repository is intended for `docker stack deploy`, not `docker compose up`.
-- The `registry_htpasswd` secret is defined as `external: true` and is not created automatically.
-- The `traefik` network is also external and must already exist.
+- Both secrets (`registry_htpasswd`, `registry_proxy_htpasswd`) are `external: true` and must be created manually before the first deploy.
+- The `traefik` network is external and must already exist.
