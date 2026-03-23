@@ -8,7 +8,7 @@ secrets:
 
 services:
   registry-proxy:
-    image: "registry:3"
+    image: "registry:3@sha256:6c5666b861f3505b116bb9aa9b25175e71210414bd010d92035ff64018f9457e"
     environment:
       REGISTRY_LOG_LEVEL: "info"
       REGISTRY_HTTP_ADDR: "0.0.0.0:5000"
@@ -40,7 +40,7 @@ services:
         traefik.http.services.registry-proxy.loadbalancer.server.port: "5000"
 
   registry:
-    image: "registry:3"
+    image: "registry:3@sha256:6c5666b861f3505b116bb9aa9b25175e71210414bd010d92035ff64018f9457e"
     environment:
       REGISTRY_LOG_LEVEL: "info"
       REGISTRY_AUTH: "htpasswd"
